@@ -994,6 +994,14 @@ def simular_avance_con_transporte(actividades_nivel, frentes_info, recursos_conf
 
     resultados = {frente: [] for frente in frentes_nombres}
     traza_eventos = []
+    # Avance REAL acumulado por turno, capturado en vivo desde avances_frentes durante la
+    # simulacion (misma fuente que "resultados"). Reemplaza el calculo posterior por conteo
+    # de ciclos en la traza de eventos, que podia mostrar avance donde el Avance Final real
+    # quedo en 0 (ciclos truncados por tiempo_limite o por bloqueo de recurso).
+    n_turnos_total = math.ceil(tiempo_limite / duracion_turno)
+    avance_por_turno_resultado = {
+        frente: {turno: [] for turno in range(1, n_turnos_total + 1)} for frente in frentes_nombres
+    }
     
     # Pre-calcular velocidades
     num_precalc = max(n_simulaciones * n_frentes * 100, 50000)
@@ -1096,6 +1104,13 @@ def simular_avance_con_transporte(actividades_nivel, frentes_info, recursos_conf
 
         # Estado de los frentes
         avances_frentes = {frente: 0 for frente in frentes_nombres}
+        # Captura del avance REAL acumulado al cierre de cada turno, tomado directamente
+        # de avances_frentes (la misma variable que usa "resultados"/Avance Final). Esto
+        # reemplaza la reconstruccion posterior desde la traza de eventos (que contaba
+        # ciclos con actividad registrada aunque estuvieran truncados por tiempo_limite o
+        # por bloqueo de recurso, inflando el avance por turno respecto al Avance Final real).
+        avance_por_turno_real = {frente: {} for frente in frentes_nombres}
+        siguiente_turno_a_registrar = {frente: 1 for frente in frentes_nombres}
         secuencia_actual_frente = {frente: 0 for frente in frentes_nombres}  # Índice en secuencias_ordenadas
         ciclos_completados_frente = {frente: 0 for frente in frentes_nombres}
         # Frentes bloqueados permanentemente por falta absoluta de un recurso requerido
@@ -1125,7 +1140,21 @@ def simular_avance_con_transporte(actividades_nivel, frentes_info, recursos_conf
             
             if current_time >= tiempo_limite:
                 break
-            
+
+            # Registrar avance REAL acumulado (avances_frentes) en cada turno cuyo limite
+            # de tiempo ya quedo atras respecto al reloj de la simulacion. Se hace para
+            # todos los frentes (no solo el del evento actual) para que un frente sin mas
+            # eventos propios (bloqueado, terminado, sin recurso) siga registrando su
+            # avance congelado en los turnos que van pasando.
+            for frente_reg in frentes_nombres:
+                turno_pendiente = siguiente_turno_a_registrar[frente_reg]
+                while turno_pendiente * duracion_turno <= current_time:
+                    avance_por_turno_real[frente_reg][turno_pendiente] = min(
+                        avances_frentes[frente_reg], frentes_info[frente_reg]['distancia']
+                    )
+                    turno_pendiente += 1
+                siguiente_turno_a_registrar[frente_reg] = turno_pendiente
+
             frente = event_data['frente']
             
             # Verificar si el frente ya completó su distancia
@@ -1550,16 +1579,45 @@ def simular_avance_con_transporte(actividades_nivel, frentes_info, recursos_conf
                     tiempo_max_secuencia = max(tiempo_max_secuencia, finish_act)
                 
                 # Agregar evento para siguiente secuencia
-                heapq.heappush(event_queue, (tiempo_max_secuencia, event_counter, 'start_sequence', {
-                    'frente': frente,
-                    'secuencia_idx': secuencia_idx + 1
-                }))
-                event_counter += 1
+                secuencia_siguiente = secuencia_idx + 1
+                if secuencia_siguiente >= len(secuencias_ordenadas) and tiempo_max_secuencia >= tiempo_limite:
+                    # Esta era la ultima secuencia del ciclo y ya no queda tiempo para que el
+                    # evento 'start_sequence' que cerraria el ciclo llegue a procesarse (el
+                    # bucle principal corta con current_time >= tiempo_limite). Sin este ajuste,
+                    # las actividades del ciclo ya quedaban en la traza (avance_actividad) pero
+                    # avances_frentes nunca sumaba esos metros: se cerraba el ciclo aqui mismo,
+                    # en el mismo instante en que se sabe que no quedan mas secuencias, en vez
+                    # de depender de un evento futuro que nunca se alcanza a procesar.
+                    metros_avance_ciclo = metros_ciclo(frente)
+                    avances_frentes[frente] += metros_avance_ciclo
+                    ciclos_completados_frente[frente] += 1
+                else:
+                    heapq.heappush(event_queue, (tiempo_max_secuencia, event_counter, 'start_sequence', {
+                        'frente': frente,
+                        'secuencia_idx': secuencia_siguiente
+                    }))
+                    event_counter += 1
         
-
         # Guardar resultados
         for frente in frentes_nombres:
-            resultados[frente].append(avances_frentes[frente])
+            avance_final_frente = min(avances_frentes[frente], frentes_info[frente]['distancia'])
+            resultados[frente].append(avance_final_frente)
+
+            # Completar los turnos que quedaron sin registrar (la simulacion termino antes
+            # de tiempo_limite, o el event_queue se vacio) con el avance final ya conocido,
+            # para que la serie por turno tenga el mismo largo para todos los frentes.
+            n_turnos_frente = math.ceil(tiempo_limite / duracion_turno)
+            turno_pendiente = siguiente_turno_a_registrar[frente]
+            while turno_pendiente <= n_turnos_frente:
+                avance_por_turno_real[frente][turno_pendiente] = avance_final_frente
+                turno_pendiente += 1
+
+            # Volcar al dict que se retorna/expone (lista ordenada 1..N, alineada 1 a 1
+            # con la simulacion "sim+1", igual que resultados[frente]).
+            for turno_idx in range(1, n_turnos_frente + 1):
+                avance_por_turno_resultado[frente][turno_idx].append(
+                    avance_por_turno_real[frente].get(turno_idx, avance_final_frente)
+                )
 
         # Notificar progreso (simulaciones completadas / total) para que la UI pueda
         # mostrar un contador tipo "3/10" y mover la barra en vivo en vez de quedar
@@ -1609,7 +1667,7 @@ def simular_avance_con_transporte(actividades_nivel, frentes_info, recursos_conf
                     'tiempo_viaje': tiempos_viaje
                 }
 
-    return resultados, estadisticas_recursos, traza_eventos, ventanas_por_recurso, registro_cambios_flota
+    return resultados, estadisticas_recursos, traza_eventos, ventanas_por_recurso, registro_cambios_flota, avance_por_turno_resultado
 
 # Funciones Auxiliares para el Cálculo por Turnos
 @st.cache_data(show_spinner=False)
@@ -3985,7 +4043,7 @@ if st.session_state.datos_cargados:
                             status_text.text(f"Simulando {completadas}/{total} escenarios...")
 
                         # Llamada a la función de simulación actualizada
-                        resultados, estadisticas_recursos, traza_eventos, ventanas_flota, registro_cambios_flota = simular_avance_con_transporte(
+                        resultados, estadisticas_recursos, traza_eventos, ventanas_flota, registro_cambios_flota, avance_por_turno_real_sim = simular_avance_con_transporte(
                             actividades_nivel, 
                             frentes_info, 
                             st.session_state.recursos_config, 
@@ -4012,7 +4070,7 @@ if st.session_state.datos_cargados:
                                 progress_bar.progress(90 + int(fraccion * 10))
                                 status_text.text(f"Simulando línea base {completadas}/{total} (sin cambios de flota)...")
 
-                            resultados_base, _, _, _, _ = simular_avance_con_transporte(
+                            resultados_base, _, _, _, _, _ = simular_avance_con_transporte(
                                 actividades_nivel,
                                 frentes_info,
                                 st.session_state.recursos_config,
@@ -4031,6 +4089,11 @@ if st.session_state.datos_cargados:
                     
                         st.session_state.resultados = resultados
                         st.session_state.resultados_base_sin_cambios_flota = resultados_base
+                        # Avance por turno REAL (misma fuente que "resultados"/Avance Final), para
+                        # que la seccion "Avance Acumulado por Turno" deje de reconstruirlo por
+                        # conteo de ciclos en la traza (fuente de la inconsistencia reportada:
+                        # mostraba avance en turnos donde el Avance Final real habia quedado en 0).
+                        st.session_state.avance_por_turno_real = avance_por_turno_real_sim
                         st.session_state.estadisticas_recursos = estadisticas_recursos
                         st.session_state.traza_eventos = traza_eventos
                         # Se construye el DataFrame UNA sola vez aqui, al terminar de simular, en vez
@@ -4301,15 +4364,25 @@ if st.session_state.datos_cargados:
                 st.write(f"**Avance Acumulado por Turno — Simulación N° {sim_seleccionada_global}**")
                 etiqueta_col_turno = f"Avance Sim. {sim_seleccionada_global}"
                 percentiles_turno_sel = None
-            df_traza_completa = st.session_state.df_traza_eventos_cache
-            avance_turnos = calcular_avance_por_turno(
-                st.session_state.run_id,
-                df_traza_completa, 
-                st.session_state.tiempo_limite, 
-                st.session_state.sistema_turnos, 
-                st.session_state.frentes_info, 
-                st.session_state.metros_avance
-            )
+            # Se usa el avance REAL por turno capturado durante la simulacion (misma fuente
+            # que "resultados"/Avance Final), en vez de calcular_avance_por_turno (que lo
+            # reconstruia contando ciclos en la traza de eventos y podia mostrar avance en
+            # turnos donde el Avance Final real habia quedado en 0, por ciclos truncados por
+            # tiempo_limite o por bloqueo de recurso). Se mantiene un fallback a la
+            # reconstruccion antigua solo por compatibilidad con corridas ya guardadas en
+            # session_state antes de este fix, que no tienen 'avance_por_turno_real'.
+            if 'avance_por_turno_real' in st.session_state and st.session_state.avance_por_turno_real:
+                avance_turnos = st.session_state.avance_por_turno_real
+            else:
+                df_traza_completa = st.session_state.df_traza_eventos_cache
+                avance_turnos = calcular_avance_por_turno(
+                    st.session_state.run_id,
+                    df_traza_completa, 
+                    st.session_state.tiempo_limite, 
+                    st.session_state.sistema_turnos, 
+                    st.session_state.frentes_info, 
+                    st.session_state.metros_avance
+                )
 
             datos_turno = []
             datos_turno_percentiles = []  # formato largo (Tunel, Turno_Num, Percentil, valor) para la grafica multi-percentil

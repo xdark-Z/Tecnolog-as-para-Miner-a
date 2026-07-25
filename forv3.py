@@ -1556,9 +1556,10 @@ def simular_avance_con_transporte(actividades_nivel, frentes_info, recursos_conf
                 }))
                 event_counter += 1
         
+
         # Guardar resultados
         for frente in frentes_nombres:
-            resultados[frente].append(min(avances_frentes[frente], frentes_info[frente]['distancia']))
+            resultados[frente].append(avances_frentes[frente])
 
         # Notificar progreso (simulaciones completadas / total) para que la UI pueda
         # mostrar un contador tipo "3/10" y mover la barra en vivo en vez de quedar
